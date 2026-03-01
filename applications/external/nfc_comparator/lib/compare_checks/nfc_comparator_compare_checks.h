@@ -1,17 +1,23 @@
 #pragma once
 
-#include <furi.h>
-#include <nfc_device.h>
-#include <nfc/protocols/mf_classic/mf_classic.h>
-#include <nfc/protocols/st25tb/st25tb.h>
-#include <nfc/protocols/mf_ultralight/mf_ultralight.h>
-#include <nfc/protocols/felica/felica.h>
-// #include <nfc/protocols/type_4_tag/type_4_tag.h>
-#include <nfc/protocols/iso15693_3/iso15693_3.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "protocols/emv/emv.h"
+#include "protocols/slix/slix.h"
+#include "protocols/mf_classic/mf_classic.h"
+#include "protocols/felica/felica.h"
+#include "protocols/mf_ultralight/mf_ultralight.h"
+#include "protocols/st25tb/st25tb.h"
+#include "protocols/iso15693_3/iso15693_3.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef struct SimpleArray SimpleArray;
+typedef struct NfcDevice NfcDevice;
+typedef struct FuriString FuriString;
 
 /**
  * @enum NfcCompareChecksType
@@ -24,19 +30,36 @@ typedef enum {
 } NfcCompareChecksType;
 
 /**
+ * @enum NfcCompareChecksDiffUnit
+ * @brief The data type which is being compared in depth
+ */
+typedef enum {
+   NfcCompareChecksComparedDataType_Blocks,
+   NfcCompareChecksComparedDataType_Pages,
+   NfcCompareChecksComparedDataType_Bytes,
+   NfcCompareChecksComparedDataType_EmvFields,
+   NfcCompareChecksComparedDataType_Unkown
+} NfcCompareChecksDiffUnit;
+
+/**
  * @struct NfcComparatorCompareChecks
  * @brief Structure holding the results of NFC comparison checks.
  */
-typedef struct {
+typedef struct NfcComparatorCompareChecks {
    NfcCompareChecksType compare_type;
    FuriString* nfc_card_path;
-   bool uid;
-   bool uid_length;
-   bool protocol;
-   bool nfc_data;
-   uint16_t diff_blocks[2048];
-   uint16_t diff_count;
-   uint16_t total_blocks;
+   struct {
+      bool uid;
+      bool uid_length;
+      bool protocol;
+      bool nfc_data;
+   } results;
+   struct {
+      NfcCompareChecksDiffUnit unit;
+      SimpleArray* indices;
+      uint16_t count;
+      uint16_t total;
+   } diff;
 } NfcComparatorCompareChecks;
 
 /**
@@ -67,15 +90,6 @@ void nfc_comparator_compare_checks_copy(
 void nfc_comparator_compare_checks_reset(NfcComparatorCompareChecks* checks);
 
 /**
- * @brief Set the comparison type.
- * @param checks Pointer to the structure.
- * @param type The type to set.
- */
-void nfc_comparator_compare_checks_set_type(
-   NfcComparatorCompareChecks* checks,
-   NfcCompareChecksType type);
-
-/**
  * @brief Compare two NFC cards and update the checks structure.
  * @param checks Pointer to the checks structure.
  * @param card1 Pointer to the first NFC card.
@@ -84,8 +98,8 @@ void nfc_comparator_compare_checks_set_type(
  */
 void nfc_comparator_compare_checks_compare_cards(
    NfcComparatorCompareChecks* checks,
-   const struct NfcDevice* card1,
-   const struct NfcDevice* card2);
+   const NfcDevice* card1,
+   const NfcDevice* card2);
 
 #ifdef __cplusplus
 }

@@ -1,4 +1,4 @@
-#include "nfc_comparator_led_worker.h"
+#include "nfc_comparator_led_worker_i.h"
 
 void nfc_comparator_led_worker_start(
    NotificationApp* notification_app,
@@ -8,10 +8,10 @@ void nfc_comparator_led_worker_start(
       notification_message_block(notification_app, &sequence_blink_start_cyan);
       break;
    case NfcComparatorLedState_Complete:
-      notification_message_block(notification_app, &sequence_blink_start_green);
+      notification_message_block(notification_app, &sequence_success);
       break;
    case NfcComparatorLedState_Error:
-      notification_message_block(notification_app, &sequence_blink_start_red);
+      notification_message_block(notification_app, &sequence_error);
       break;
    default:
       break;

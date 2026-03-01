@@ -10,8 +10,7 @@ void nfc_comparator_physical_compare_scan_scene_on_enter(void* context) {
     popup_set_context(nfc_comparator->views.popup, nfc_comparator);
     view_dispatcher_switch_to_view(nfc_comparator->view_dispatcher, NfcComparatorView_Popup);
 
-    nfc_comparator_compare_checks_set_type(
-        nfc_comparator->workers.compare_checks, NfcCompareChecksType_Shallow);
+    nfc_comparator->workers.compare_checks->compare_type = NfcCompareChecksType_Shallow;
 
     nfc_comparator->workers.reader_worker =
         nfc_comparator_reader_worker_alloc(nfc_comparator->workers.compare_checks);
@@ -63,6 +62,10 @@ bool nfc_comparator_physical_compare_scan_scene_on_event(void* context, SceneMan
         case NfcComparatorReaderWorkerState_Stopped:
             if(!force_quit) {
                 nfc_comparator_reader_worker_stop(nfc_comparator->workers.reader_worker);
+
+                nfc_comparator_led_worker_stop(nfc_comparator->notification_app);
+                nfc_comparator_led_worker_start(
+                    nfc_comparator->notification_app, NfcComparatorLedState_Complete);
 
                 scene_manager_next_scene(
                     nfc_comparator->scene_manager, NfcComparatorScene_CompareResults);

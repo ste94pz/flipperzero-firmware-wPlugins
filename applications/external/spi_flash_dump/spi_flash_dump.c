@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 #include <datetime/datetime.h>
+#include <toolbox/crc32_calc.h>
 
 /* ================================================================== */
 /*  Helper – SPI speed enum → clock delay in microseconds             */
@@ -66,8 +67,10 @@ typedef struct {
     uint32_t bytes_done;
     uint32_t total;
     uint32_t start_tick;
+    uint32_t crc32;
     bool finished;
     bool success;
+    bool crc32_valid;
 } ReadProgressModel;
 
 static void read_progress_draw_cb(Canvas* canvas, void* model_ptr) {
@@ -125,7 +128,13 @@ static void read_progress_draw_cb(Canvas* canvas, void* model_ptr) {
     if(m->finished) {
         canvas_set_font(canvas, FontPrimary);
         if(m->success) {
-            canvas_draw_str_aligned(canvas, 64, 53, AlignCenter, AlignTop, "DONE! Press OK");
+            canvas_draw_str_aligned(canvas, 64, 44, AlignCenter, AlignTop, "DONE! Press OK");
+            if(m->crc32_valid) {
+                char crc_str[20];
+                snprintf(crc_str, sizeof(crc_str), "CRC32: 0x%08lX", (unsigned long)m->crc32);
+                canvas_set_font(canvas, FontSecondary);
+                canvas_draw_str_aligned(canvas, 64, 54, AlignCenter, AlignTop, crc_str);
+            }
         } else {
             canvas_draw_str_aligned(canvas, 64, 53, AlignCenter, AlignTop, "ERROR! Press Back");
         }
@@ -348,43 +357,21 @@ static bool app_custom_event_cb(void* ctx, uint32_t event) {
 
 static void wiring_guide_setup(SpiFlashDumpApp* app) {
     widget_reset(app->wiring_guide);
-    widget_add_text_scroll_element(
-        app->wiring_guide,
-        0,
-        0,
-        128,
-        64,
-        "SPI Flash Wiring:\n"
-        "CLK  -> Pin 5 (PB3)\n"
-        "MISO -> Pin 6 (PA6)\n"
-        "MOSI -> Pin 7 (PA7)\n"
-        "CS   -> Pin 4 (PA4)\n"
-        "VCC  -> Pin 9 (3V3)\n"
-        "GND  -> Pin 8 (GND)\n"
-        "\n"
-        "Press OK to detect chip");
+    widget_add_string_element(
+        app->wiring_guide, 64, 0, AlignCenter, AlignTop, FontPrimary, "SPI Flash Wiring");
+    widget_add_string_element(
+        app->wiring_guide, 0, 12, AlignLeft, AlignTop, FontSecondary, "CLK  -> Pin 5 (PB3)");
+    widget_add_string_element(
+        app->wiring_guide, 0, 21, AlignLeft, AlignTop, FontSecondary, "MISO -> Pin 6 (PA6)");
+    widget_add_string_element(
+        app->wiring_guide, 0, 30, AlignLeft, AlignTop, FontSecondary, "MOSI -> Pin 7 (PA7)");
+    widget_add_string_element(
+        app->wiring_guide, 0, 39, AlignLeft, AlignTop, FontSecondary, "CS   -> Pin 4 (PA4)");
+    widget_add_string_element(
+        app->wiring_guide, 0, 48, AlignLeft, AlignTop, FontSecondary, "VCC:Pin9  GND:Pin8");
+    widget_add_string_element(
+        app->wiring_guide, 64, 57, AlignCenter, AlignTop, FontSecondary, "OK=Detect  Right=Cfg");
 }
-
-/* ================================================================== */
-/*  Helper to retrieve a View's current input callback                */
-/*  The Flipper SDK does not expose a getter, so we peek at the       */
-/*  well-known struct layout (draw_cb, input_cb are the first two     */
-/*  function pointers).                                               */
-/* ================================================================== */
-typedef struct {
-    ViewDrawCallback draw_callback;
-    ViewInputCallback input_callback;
-    /* remaining fields not accessed */
-} ViewPeek;
-
-static ViewInputCallback view_peek_input_callback(View* view) {
-    const ViewPeek* peek = (const ViewPeek*)(void*)view;
-    return peek->input_callback;
-}
-
-/* Original widget input callbacks (stored before override) */
-static ViewInputCallback wiring_guide_original_input_cb;
-static ViewInputCallback chip_info_original_input_cb;
 
 static bool wiring_guide_input_cb(InputEvent* event, void* ctx) {
     SpiFlashDumpApp* app = ctx;
@@ -491,10 +478,6 @@ static bool wiring_guide_input_cb(InputEvent* event, void* ctx) {
         return true;
     }
 
-    /* Pass all other keys (including scroll) to the original widget handler */
-    if(wiring_guide_original_input_cb) {
-        return wiring_guide_original_input_cb(event, ctx);
-    }
     return false;
 }
 
@@ -539,6 +522,8 @@ static bool chip_info_input_cb(InputEvent* event, void* ctx) {
                 m->start_tick = app->progress_start_tick;
                 m->finished = false;
                 m->success = false;
+                m->crc32 = 0;
+                m->crc32_valid = false;
             },
             true);
 
@@ -569,10 +554,6 @@ static bool chip_info_input_cb(InputEvent* event, void* ctx) {
         return true;
     }
 
-    /* Pass all other keys (including scroll) to the original widget handler */
-    if(chip_info_original_input_cb) {
-        return chip_info_original_input_cb(event, ctx);
-    }
     return false;
 }
 
@@ -648,6 +629,23 @@ static void worker_poll_timer_cb(void* ctx) {
 
         if(app->worker_state == SpiWorkerStateReading) {
             app->worker_state = result ? SpiWorkerStateDone : SpiWorkerStateError;
+
+            /* Calculate CRC32 of the dumped file on the main thread, now that
+               the worker has finished and the file handle is fully closed. */
+            uint32_t crc32 = 0;
+            bool crc32_valid = false;
+            if(result) {
+                Storage* storage = furi_record_open(RECORD_STORAGE);
+                File* crc_file = storage_file_alloc(storage);
+                if(storage_file_open(crc_file, app->dump_path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+                    crc32 = crc32_calc_file(crc_file, NULL, NULL);
+                    crc32_valid = true;
+                    storage_file_close(crc_file);
+                }
+                storage_file_free(crc_file);
+                furi_record_close(RECORD_STORAGE);
+            }
+
             with_view_model(
                 app->read_progress_view,
                 ReadProgressModel * m,
@@ -655,6 +653,8 @@ static void worker_poll_timer_cb(void* ctx) {
                     m->finished = true;
                     m->success = result;
                     m->bytes_done = app->progress_bytes;
+                    m->crc32 = crc32;
+                    m->crc32_valid = crc32_valid;
                 },
                 true);
 
@@ -706,6 +706,7 @@ static uint32_t progress_back_cb(void* ctx) {
 
 static SpiFlashDumpApp* spi_flash_dump_app_alloc(void) {
     SpiFlashDumpApp* app = malloc(sizeof(SpiFlashDumpApp));
+    furi_assert(app);
     memset(app, 0, sizeof(SpiFlashDumpApp));
 
     /* Defaults */
@@ -733,8 +734,6 @@ static SpiFlashDumpApp* spi_flash_dump_app_alloc(void) {
     /* ---- Wiring Guide (Widget) ---- */
     app->wiring_guide = widget_alloc();
     wiring_guide_setup(app);
-    /* Store original widget input callback before overriding, so scroll still works */
-    wiring_guide_original_input_cb = view_peek_input_callback(widget_get_view(app->wiring_guide));
     view_set_input_callback(widget_get_view(app->wiring_guide), wiring_guide_input_cb);
     view_set_context(widget_get_view(app->wiring_guide), app);
     view_dispatcher_add_view(
@@ -742,8 +741,6 @@ static SpiFlashDumpApp* spi_flash_dump_app_alloc(void) {
 
     /* ---- Chip Info (Widget) ---- */
     app->chip_info_widget = widget_alloc();
-    /* Store original widget input callback before overriding, so scroll still works */
-    chip_info_original_input_cb = view_peek_input_callback(widget_get_view(app->chip_info_widget));
     view_set_input_callback(widget_get_view(app->chip_info_widget), chip_info_input_cb);
     view_set_context(widget_get_view(app->chip_info_widget), app);
     view_dispatcher_add_view(

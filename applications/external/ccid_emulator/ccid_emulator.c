@@ -12,6 +12,9 @@
 #include <gui/view.h>
 #include <gui/elements.h>
 #include <storage/storage.h>
+#include <datetime/datetime.h>
+#include <notification/notification.h>
+#include <notification/notification_messages.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -147,11 +150,116 @@ static bool apdu_monitor_input(InputEvent* event, void* context) {
                 },
                 true);
             return true;
+        } else if(event->key == InputKeyRight && event->type == InputTypeShort) {
+            /* Right (short) -> export APDU log to SD card */
+            view_dispatcher_send_custom_event(app->view_dispatcher, CcidEmulatorEventExportLog);
+            return true;
         }
     }
 
     /* Let Back propagate to ViewDispatcher so navigation works */
     return false;
+}
+
+/* =========================================================================
+ * APDU Log Export
+ * ========================================================================= */
+
+/**
+ * Dump the current in-memory APDU ring buffer to a timestamped file on the SD
+ * card under /ext/ccid_emulator/logs/.
+ *
+ * Format per entry:
+ *   [001] CMD: 00 A4 04 00 -> RSP: 6F 19 ... 90 00 (matched)
+ *   [002] CMD: 00 B2 01 0C -> RSP: 6A 82 (default)
+ *
+ * Returns true on success, false on any I/O error.
+ */
+static bool ccid_emulator_export_log(CcidEmulatorApp* app) {
+    furi_assert(app);
+
+    furi_mutex_acquire(app->log_mutex, FuriWaitForever);
+
+    uint16_t total = app->log_count;
+    uint16_t stored = (total > CCID_EMU_LOG_MAX_ENTRIES) ? CCID_EMU_LOG_MAX_ENTRIES : total;
+
+    if(stored == 0) {
+        furi_mutex_release(app->log_mutex);
+        return false;
+    }
+
+    /* Ensure logs directory exists */
+    storage_simply_mkdir(app->storage, CCID_EMU_LOGS_DIR);
+
+    /* Build timestamped file path */
+    DateTime dt;
+    datetime_timestamp_to_datetime(furi_hal_rtc_get_timestamp(), &dt);
+
+    char path[128];
+    snprintf(
+        path,
+        sizeof(path),
+        CCID_EMU_LOGS_DIR "/apdu_%04d%02d%02d_%02d%02d%02d.log",
+        dt.year,
+        dt.month,
+        dt.day,
+        dt.hour,
+        dt.minute,
+        dt.second);
+
+    Stream* stream = file_stream_alloc(app->storage);
+    bool ok = file_stream_open(stream, path, FSAM_WRITE, FSOM_CREATE_ALWAYS);
+    if(!ok) {
+        FURI_LOG_E("CcidApp", "Cannot create log file: %s", path);
+        stream_free(stream);
+        furi_mutex_release(app->log_mutex);
+        return false;
+    }
+
+    /* Write header */
+    char header[128];
+    snprintf(
+        header,
+        sizeof(header),
+        "# CCID APDU log -- %04d-%02d-%02d %02d:%02d:%02d\n"
+        "# %u entr%s\n\n",
+        dt.year,
+        dt.month,
+        dt.day,
+        dt.hour,
+        dt.minute,
+        dt.second,
+        stored,
+        stored == 1 ? "y" : "ies");
+    stream_write_cstring(stream, header);
+
+    /* The ring buffer oldest entry when it has wrapped:
+       ring_start = log_count % LOG_MAX_ENTRIES           (wrapped case)
+       ring_start = 0                                     (not yet wrapped)  */
+    uint16_t ring_start = (app->log_count > CCID_EMU_LOG_MAX_ENTRIES) ?
+                              (uint16_t)(app->log_count % CCID_EMU_LOG_MAX_ENTRIES) :
+                              0;
+
+    /* Write entries using fixed-size prefix + streamed hex strings to avoid
+       large stack allocations (CCID_EMU_MAX_HEX_STR can be ~1536 bytes). */
+    for(uint16_t i = 0; i < stored; i++) {
+        uint16_t ring_idx = (ring_start + i) % CCID_EMU_LOG_MAX_ENTRIES;
+        const CcidApduLogEntry* e = &app->log_entries[ring_idx];
+
+        char prefix[16];
+        snprintf(prefix, sizeof(prefix), "[%03u] CMD: ", (unsigned)(i + 1));
+        stream_write_cstring(stream, prefix);
+        stream_write_cstring(stream, e->command_hex);
+        stream_write_cstring(stream, " -> RSP: ");
+        stream_write_cstring(stream, e->response_hex);
+        stream_write_cstring(stream, e->matched ? " (matched)\n" : " (default)\n");
+    }
+
+    stream_free(stream);
+    furi_mutex_release(app->log_mutex);
+
+    FURI_LOG_I("CcidApp", "APDU log exported to %s (%u entries)", path, stored);
+    return true;
 }
 
 /* =========================================================================
@@ -197,6 +305,12 @@ static void discover_card_files(CcidEmulatorApp* app) {
     }
 
     app->card_paths = malloc(sizeof(char*) * count);
+    if(!app->card_paths) {
+        FURI_LOG_E("CcidApp", "OOM allocating card_paths");
+        storage_dir_close(dir);
+        storage_file_free(dir);
+        return;
+    }
     app->card_path_count = 0;
 
     /* Rewind directory and collect paths */
@@ -209,6 +323,10 @@ static void discover_card_files(CcidEmulatorApp* app) {
             /* Build full path */
             size_t path_len = strlen(CCID_EMU_CARDS_DIR) + 1 + nlen + 1;
             char* path = malloc(path_len);
+            if(!path) {
+                FURI_LOG_E("CcidApp", "OOM allocating card path");
+                break;
+            }
             snprintf(path, path_len, "%s/%s", CCID_EMU_CARDS_DIR, name_buf);
             app->card_paths[app->card_path_count++] = path;
             if(app->card_path_count >= count) break;
@@ -420,22 +538,23 @@ static bool custom_event_handler(void* context, uint32_t event) {
         return true;
 
     case CcidEmulatorEventApduExchange:
-        /* A new APDU log entry was added -- trigger redraw of the monitor */
-        if(app->apdu_monitor) {
-            with_view_model(
-                app->apdu_monitor,
-                ApduMonitorModel * model,
-                {
-                    /* Auto-scroll to latest */
-                    uint16_t total = app->log_count;
-                    if(total > CCID_EMU_LOG_MAX_ENTRIES) total = CCID_EMU_LOG_MAX_ENTRIES;
-                    uint16_t max_off =
-                        (total > APDU_MON_MAX_VISIBLE) ? total - APDU_MON_MAX_VISIBLE : 0;
-                    model->scroll_offset = max_off;
-                },
-                true);
-        }
+        /* Legacy event — no longer sent from the USB callback.  The
+         * apdu_refresh_timer now handles redraws.  Keep the case to avoid
+         * compiler warnings about the enum value. */
         return true;
+
+    case CcidEmulatorEventExportLog: {
+        /* Export APDU log to /ext/ccid_emulator/logs/ and vibrate on success */
+        bool exported = ccid_emulator_export_log(app);
+        NotificationApp* notif = furi_record_open(RECORD_NOTIFICATION);
+        if(exported) {
+            notification_message(notif, &sequence_success);
+        } else {
+            notification_message(notif, &sequence_error);
+        }
+        furi_record_close(RECORD_NOTIFICATION);
+        return true;
+    }
 
     default:
         return false;
@@ -470,6 +589,34 @@ static bool navigation_event_handler(void* context) {
  * App alloc / free
  * ========================================================================= */
 
+/* =========================================================================
+ * APDU monitor refresh timer callback — polls log_dirty flag every 200 ms.
+ *
+ * Replaces the direct view_dispatcher_send_custom_event() that used to be
+ * called from the USB CCID callback thread (which could overflow the event
+ * queue and cause furi_check failures under heavy APDU load).
+ * ========================================================================= */
+static void ccid_apdu_refresh_timer_cb(void* ctx) {
+    CcidEmulatorApp* app = (CcidEmulatorApp*)ctx;
+
+    if(!app->log_dirty) return;
+    app->log_dirty = false;
+
+    if(app->apdu_monitor) {
+        with_view_model(
+            app->apdu_monitor,
+            ApduMonitorModel * model,
+            {
+                uint16_t total = app->log_count;
+                if(total > CCID_EMU_LOG_MAX_ENTRIES) total = CCID_EMU_LOG_MAX_ENTRIES;
+                uint16_t max_off = (total > APDU_MON_MAX_VISIBLE) ? total - APDU_MON_MAX_VISIBLE :
+                                                                    0;
+                model->scroll_offset = max_off;
+            },
+            true);
+    }
+}
+
 static CcidEmulatorApp* ccid_emulator_app_alloc(void) {
     CcidEmulatorApp* app = malloc(sizeof(CcidEmulatorApp));
     memset(app, 0, sizeof(CcidEmulatorApp));
@@ -477,9 +624,10 @@ static CcidEmulatorApp* ccid_emulator_app_alloc(void) {
     /* Storage */
     app->storage = furi_record_open(RECORD_STORAGE);
 
-    /* Ensure cards directory exists and write sample if first run */
+    /* Ensure directory tree exists and write sample cards on first run */
     storage_simply_mkdir(app->storage, EXT_PATH("ccid_emulator"));
     storage_simply_mkdir(app->storage, CCID_EMU_CARDS_DIR);
+    storage_simply_mkdir(app->storage, CCID_EMU_LOGS_DIR);
     ccid_card_write_sample(app->storage);
 
     /* GUI */
@@ -533,6 +681,11 @@ static CcidEmulatorApp* ccid_emulator_app_alloc(void) {
     /* Log mutex */
     app->log_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
 
+    /* APDU monitor refresh timer — 200 ms periodic, polls log_dirty flag. */
+    app->apdu_refresh_timer =
+        furi_timer_alloc(ccid_apdu_refresh_timer_cb, FuriTimerTypePeriodic, app);
+    furi_timer_start(app->apdu_refresh_timer, furi_ms_to_ticks(200));
+
     /* Default preset */
     app->usb_preset_index = 0;
 
@@ -576,6 +729,13 @@ static void ccid_emulator_app_free(CcidEmulatorApp* app) {
             free(app->card_paths[i]);
         }
         free(app->card_paths);
+    }
+
+    /* Refresh timer */
+    if(app->apdu_refresh_timer) {
+        furi_timer_stop(app->apdu_refresh_timer);
+        furi_timer_free(app->apdu_refresh_timer);
+        app->apdu_refresh_timer = NULL;
     }
 
     /* Mutex */

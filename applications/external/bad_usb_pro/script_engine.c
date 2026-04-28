@@ -7,6 +7,95 @@
 #include <string.h>
 #include <ctype.h>
 
+/* ════════════════════════════════════════════════════════════════════════════
+ *  Consumer key name → HID consumer usage ID mapping
+ * ════════════════════════════════════════════════════════════════════════════ */
+typedef struct {
+    const char* name;
+    uint16_t usage_id;
+} ConsumerKeyMapping;
+
+static const ConsumerKeyMapping consumer_key_map[] = {
+    /* Media transport */
+    {"PLAY", 0xB0},
+    {"PAUSE", 0xB1},
+    {"PLAY_PAUSE", 0xCD},
+    {"STOP", 0xB7},
+    {"RECORD", 0xB2},
+    {"NEXT_TRACK", 0xB5},
+    {"PREV_TRACK", 0xB6},
+    {"PREVIOUS_TRACK", 0xB6},
+    {"FAST_FORWARD", 0xB3},
+    {"FF", 0xB3},
+    {"REWIND", 0xB4},
+    {"RW", 0xB4},
+    {"EJECT", 0xB8},
+    {"RANDOM_PLAY", 0xB9},
+    {"REPEAT", 0xBC},
+    /* Volume */
+    {"VOLUME_UP", 0xE9},
+    {"VOL_UP", 0xE9},
+    {"VOLUME_DOWN", 0xEA},
+    {"VOL_DOWN", 0xEA},
+    {"MUTE", 0xE2},
+    {"BASS_BOOST", 0xE5},
+    /* Power */
+    {"POWER", 0x30},
+    {"SLEEP", 0x32},
+    /* Navigation */
+    {"MENU", 0x40},
+    {"MENU_PICK", 0x41},
+    {"MENU_UP", 0x42},
+    {"MENU_DOWN", 0x43},
+    {"MENU_LEFT", 0x44},
+    {"MENU_RIGHT", 0x45},
+    {"MENU_ESCAPE", 0x46},
+    /* App launchers */
+    {"EMAIL", 0x18A},
+    {"CALCULATOR", 0x192},
+    {"MY_COMPUTER", 0x194},
+    {"EXPLORER", 0x194},
+    {"BROWSER", 0x196},
+    {"INTERNET", 0x196},
+    /* Application controls */
+    {"AC_SEARCH", 0x221},
+    {"AC_HOME", 0x223},
+    {"AC_BACK", 0x224},
+    {"AC_FORWARD", 0x225},
+    {"AC_STOP", 0x226},
+    {"AC_REFRESH", 0x227},
+    {"AC_BOOKMARKS", 0x22A},
+    {"AC_ZOOM_IN", 0x22D},
+    {"AC_ZOOM_OUT", 0x22E},
+    /* Browser aliases */
+    {"BROWSER_HOME", 0x223},
+    {"BROWSER_BACK", 0x224},
+    {"BROWSER_FORWARD", 0x225},
+    {"BROWSER_STOP", 0x226},
+    {"BROWSER_REFRESH", 0x227},
+    {"BROWSER_SEARCH", 0x221},
+    {"BROWSER_BOOKMARKS", 0x22A},
+    {"BROWSER_FAVORITES", 0x22A},
+    /* Misc */
+    {"SNAPSHOT", 0x65},
+};
+
+static const size_t consumer_key_map_size = sizeof(consumer_key_map) / sizeof(consumer_key_map[0]);
+
+static uint16_t resolve_consumer_key(const char* name) {
+    const char* trimmed = ducky_skip_ws(name);
+    for(size_t i = 0; i < consumer_key_map_size; i++) {
+        if(ducky_strcicmp(trimmed, consumer_key_map[i].name) == 0) {
+            return consumer_key_map[i].usage_id;
+        }
+    }
+    /* Support raw hex values (e.g. "0xCD") */
+    if(trimmed[0] == '0' && (trimmed[1] == 'x' || trimmed[1] == 'X')) {
+        return (uint16_t)strtol(trimmed, NULL, 16);
+    }
+    return 0;
+}
+
 /* strtok_r replacement – not available in Flipper SDK */
 static char* my_strtok_r(char* str, const char* delim, char** saveptr) {
     char* s = str ? str : *saveptr;
@@ -127,7 +216,13 @@ static void substitute_vars(ScriptEngine* engine, const char* input, char* out, 
             const char* val = script_engine_get_var(engine, vname);
             if(val) {
                 size_t vlen = strlen(val);
-                if(oi + vlen < out_size - 1) {
+                size_t remaining = out_size - 1 - oi;
+                if(vlen > remaining) {
+                    FURI_LOG_W(
+                        "BadUSB", "Var $%s truncated: %zu -> %zu bytes", vname, vlen, remaining);
+                    vlen = remaining;
+                }
+                if(vlen > 0) {
                     memcpy(out + oi, val, vlen);
                     oi += vlen;
                 }
@@ -216,12 +311,13 @@ static void type_char(char ch) {
     uint16_t keycode = mapped & 0x7FFF;
 
     if(need_shift) {
-        furi_hal_hid_kb_press(HID_KEYBOARD_L_SHIFT);
-    }
-    furi_hal_hid_kb_press(keycode);
-    furi_hal_hid_kb_release(keycode);
-    if(need_shift) {
-        furi_hal_hid_kb_release(HID_KEYBOARD_L_SHIFT);
+        furi_hal_hid_kb_press(KEY_MOD_LEFT_SHIFT | keycode);
+        furi_delay_ms(2);
+        furi_hal_hid_kb_release(KEY_MOD_LEFT_SHIFT | keycode);
+    } else {
+        furi_hal_hid_kb_press(keycode);
+        furi_delay_ms(2);
+        furi_hal_hid_kb_release(keycode);
     }
 }
 
@@ -235,17 +331,17 @@ static void type_string(ScriptEngine* engine, const char* str) {
     }
 }
 
-/** Press a key combo (array of keycodes — modifiers first, regular key last) */
+/** Press a key combo (array of KEY_MOD_* modifier bits + regular key).
+ *  OR all entries together into one combined 16-bit value so the modifier
+ *  byte and keycode byte are both set in a single HID report. */
 static void press_key_combo(const uint16_t* keycodes, uint8_t count) {
-    /* Press all keys */
+    uint16_t combo = 0;
     for(uint8_t i = 0; i < count; i++) {
-        furi_hal_hid_kb_press(keycodes[i]);
+        combo |= keycodes[i];
     }
-    furi_delay_ms(10); /* brief hold */
-    /* Release in reverse */
-    for(int8_t i = (int8_t)(count - 1); i >= 0; i--) {
-        furi_hal_hid_kb_release(keycodes[i]);
-    }
+    furi_hal_hid_kb_press(combo);
+    furi_delay_ms(30);
+    furi_hal_hid_kb_release(combo);
 }
 
 /** Press and release a single HID key */
@@ -589,6 +685,7 @@ void script_engine_stop(ScriptEngine* engine) {
     if(engine->state == ScriptStateRunning || engine->state == ScriptStatePaused) {
         engine->state = ScriptStateDone;
         furi_hal_hid_kb_release_all();
+        furi_hal_hid_consumer_key_release_all();
         notify_ui(engine);
     }
 }
@@ -944,10 +1041,21 @@ void script_engine_run(ScriptEngine* engine) {
             furi_hal_hid_mouse_scroll((int8_t)tok->int_value);
             break;
 
-        case TokenConsumerKey:
-            /* Consumer keys — store key name, we'd need a consumer HID map.
-             * For now, log it. Real implementation would map to HID consumer usage IDs. */
+        case TokenConsumerKey: {
+            uint16_t consumer_id = resolve_consumer_key(tok->str_value);
+            if(consumer_id != 0) {
+                furi_hal_hid_consumer_key_press(consumer_id);
+                furi_delay_ms(10);
+                furi_hal_hid_consumer_key_release(consumer_id);
+            }
             break;
+        }
+
+        case TokenRestart:
+            /* Reset program counter to restart from the beginning */
+            engine->pc = 0;
+            engine->call_depth = 0;
+            continue; /* skip pc++ */
 
         default:
             break;
@@ -967,5 +1075,6 @@ void script_engine_run(ScriptEngine* engine) {
         engine->state = ScriptStateDone;
     }
     furi_hal_hid_kb_release_all();
+    furi_hal_hid_consumer_key_release_all();
     notify_ui(engine);
 }

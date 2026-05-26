@@ -69,6 +69,7 @@ typedef struct {
     uint8_t mcp_clock; // 0 = 16MHz (default), 1 = 8MHz
     bool gtw_shield; // 0x7FF ban defense shield
     bool tlssc_restore; // 0x331 DAS config spoof to restore TLSSC
+    bool ap_first; // 2026.14.x: delay injection until AP is engaged
     bool gtw_tier_override; // 0x7FF active tier=SELF_DRIVING override
 
     // driver assist overrides (0x3F8 + 0x3FD)
@@ -78,6 +79,7 @@ typedef struct {
     bool assist_lhd_override; // force left-hand drive
     bool assist_show_lane_graph; // lane visualization
     bool assist_tlssc_bit38; // explicit TLSSC enable on 0x3FD mux0
+    bool assist_telemetry_off; // force trip telemetry off (0x3F8 bit43)
 
     // extras toggles (BETA — need on-vehicle verification per CAN ID)
     bool extra_hazard_lights;

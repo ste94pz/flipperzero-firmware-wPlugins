@@ -1,6 +1,18 @@
 #include "kdbx_protected.h"
 #include <stdlib.h>
 
+#ifndef KDBX_PROTECTED_CHACHA_XOR_STANDALONE
+#define KDBX_PROTECTED_CHACHA_XOR_STANDALONE 0
+#endif
+
+#ifndef KDBX_PROTECTED_ENABLE_KEY_DERIVE
+#define KDBX_PROTECTED_ENABLE_KEY_DERIVE 1
+#endif
+
+#ifndef KDBX_PROTECTED_ENABLE_SALSA20
+#define KDBX_PROTECTED_ENABLE_SALSA20 1
+#endif
+
 #define KDBX_PROTECTED_CHACHA_BLOCK_SIZE 64U
 #define KDBX_PROTECTED_SALSA_BLOCK_SIZE  64U
 
@@ -439,6 +451,7 @@ static void kdbx_chacha20_generate_block(KDBXProtectedStream* stream) {
     memzero(working, sizeof(working));
 }
 
+#if KDBX_PROTECTED_ENABLE_SALSA20
 static void kdbx_salsa20_generate_block(KDBXProtectedStream* stream) {
     uint32_t working[16];
 
@@ -478,6 +491,7 @@ static void kdbx_salsa20_generate_block(KDBXProtectedStream* stream) {
     stream->block_offset = 0U;
     memzero(working, sizeof(working));
 }
+#endif
 
 void kdbx_protected_stream_reset(KDBXProtectedStream* stream) {
     if(stream == NULL) {
@@ -487,20 +501,89 @@ void kdbx_protected_stream_reset(KDBXProtectedStream* stream) {
     memzero(stream, sizeof(KDBXProtectedStream));
 }
 
+bool kdbx_protected_stream_init_prederived(
+    KDBXProtectedStream* stream,
+    KDBXProtectedStreamAlgorithm algorithm,
+    const uint8_t* material,
+    size_t material_size) {
+    furi_assert(stream);
+
+    kdbx_protected_stream_reset(stream);
+
+    if(algorithm == KDBXProtectedStreamNone) {
+        stream->ready = false;
+        return true;
+    }
+    if(algorithm == KDBXProtectedStreamArcFourVariant || material == NULL) {
+        return false;
+    }
+
+    if(algorithm == KDBXProtectedStreamChaCha20) {
+        if(material_size != KDBX_PROTECTED_STREAM_CHACHA20_MATERIAL_SIZE) {
+            return false;
+        }
+
+        stream->algorithm = algorithm;
+        stream->ready = kdbx_chacha20_init_state(
+            stream->state.chacha20.state, material, 32U, material + 32U, 12U, 0U);
+        stream->block_offset = sizeof(stream->block);
+        return stream->ready;
+    }
+
+    if(algorithm == KDBXProtectedStreamSalsa20) {
+#if KDBX_PROTECTED_ENABLE_SALSA20
+        static const uint32_t sigma[4] = {0x61707865U, 0x3320646EU, 0x79622D32U, 0x6B206574U};
+        static const uint8_t nonce[8] = {0xE8U, 0x30U, 0x09U, 0x4BU, 0x97U, 0x20U, 0x5DU, 0x2AU};
+
+        if(material_size != KDBX_PROTECTED_STREAM_SALSA20_MATERIAL_SIZE) {
+            return false;
+        }
+
+        stream->algorithm = algorithm;
+        stream->ready = true;
+        stream->block_offset = sizeof(stream->block);
+        stream->state.salsa20.state[0] = sigma[0];
+        stream->state.salsa20.state[1] = kdbx_read_u32_le(&material[0]);
+        stream->state.salsa20.state[2] = kdbx_read_u32_le(&material[4]);
+        stream->state.salsa20.state[3] = kdbx_read_u32_le(&material[8]);
+        stream->state.salsa20.state[4] = kdbx_read_u32_le(&material[12]);
+        stream->state.salsa20.state[5] = sigma[1];
+        stream->state.salsa20.state[6] = kdbx_read_u32_le(&nonce[0]);
+        stream->state.salsa20.state[7] = kdbx_read_u32_le(&nonce[4]);
+        stream->state.salsa20.state[8] = 0U;
+        stream->state.salsa20.state[9] = 0U;
+        stream->state.salsa20.state[10] = sigma[2];
+        stream->state.salsa20.state[11] = kdbx_read_u32_le(&material[16]);
+        stream->state.salsa20.state[12] = kdbx_read_u32_le(&material[20]);
+        stream->state.salsa20.state[13] = kdbx_read_u32_le(&material[24]);
+        stream->state.salsa20.state[14] = kdbx_read_u32_le(&material[28]);
+        stream->state.salsa20.state[15] = sigma[3];
+        return true;
+#else
+        UNUSED(material);
+        UNUSED(material_size);
+        return false;
+#endif
+    }
+
+    return false;
+}
+
+#if KDBX_PROTECTED_ENABLE_KEY_DERIVE
 bool kdbx_protected_stream_init(
     KDBXProtectedStream* stream,
     KDBXProtectedStreamAlgorithm algorithm,
     const uint8_t* key,
     size_t key_size) {
-    uint8_t hash[SHA512_DIGEST_LENGTH];
-    uint8_t hash32[SHA256_DIGEST_LENGTH];
+    uint8_t material[KDBX_PROTECTED_STREAM_MATERIAL_MAX];
+    size_t material_size = 0U;
+    bool ready = false;
 
     furi_assert(stream);
     furi_assert(key);
 
-    kdbx_protected_stream_reset(stream);
-
     if(algorithm == KDBXProtectedStreamNone) {
+        kdbx_protected_stream_reset(stream);
         stream->ready = false;
         return true;
     }
@@ -509,44 +592,24 @@ bool kdbx_protected_stream_init(
     }
 
     if(algorithm == KDBXProtectedStreamChaCha20) {
-        sha512_Raw(key, key_size, hash);
-        stream->algorithm = algorithm;
-        stream->ready =
-            kdbx_chacha20_init_state(stream->state.chacha20.state, hash, 32U, &hash[32], 12U, 0U);
-        stream->block_offset = sizeof(stream->block);
-        memzero(hash, sizeof(hash));
-        return stream->ready;
+        sha512_Raw(key, key_size, material);
+        material_size = KDBX_PROTECTED_STREAM_CHACHA20_MATERIAL_SIZE;
+        ready = kdbx_protected_stream_init_prederived(stream, algorithm, material, material_size);
+        memzero(material, sizeof(material));
+        return ready;
     }
 
     if(algorithm == KDBXProtectedStreamSalsa20) {
-        static const uint32_t sigma[4] = {0x61707865U, 0x3320646EU, 0x79622D32U, 0x6B206574U};
-        static const uint8_t nonce[8] = {0xE8U, 0x30U, 0x09U, 0x4BU, 0x97U, 0x20U, 0x5DU, 0x2AU};
-        sha256_Raw(key, key_size, hash32);
-        stream->algorithm = algorithm;
-        stream->ready = true;
-        stream->block_offset = sizeof(stream->block);
-        stream->state.salsa20.state[0] = sigma[0];
-        stream->state.salsa20.state[1] = kdbx_read_u32_le(&hash32[0]);
-        stream->state.salsa20.state[2] = kdbx_read_u32_le(&hash32[4]);
-        stream->state.salsa20.state[3] = kdbx_read_u32_le(&hash32[8]);
-        stream->state.salsa20.state[4] = kdbx_read_u32_le(&hash32[12]);
-        stream->state.salsa20.state[5] = sigma[1];
-        stream->state.salsa20.state[6] = kdbx_read_u32_le(&nonce[0]);
-        stream->state.salsa20.state[7] = kdbx_read_u32_le(&nonce[4]);
-        stream->state.salsa20.state[8] = 0U;
-        stream->state.salsa20.state[9] = 0U;
-        stream->state.salsa20.state[10] = sigma[2];
-        stream->state.salsa20.state[11] = kdbx_read_u32_le(&hash32[16]);
-        stream->state.salsa20.state[12] = kdbx_read_u32_le(&hash32[20]);
-        stream->state.salsa20.state[13] = kdbx_read_u32_le(&hash32[24]);
-        stream->state.salsa20.state[14] = kdbx_read_u32_le(&hash32[28]);
-        stream->state.salsa20.state[15] = sigma[3];
-        memzero(hash32, sizeof(hash32));
-        return true;
+        sha256_Raw(key, key_size, material);
+        material_size = KDBX_PROTECTED_STREAM_SALSA20_MATERIAL_SIZE;
+        ready = kdbx_protected_stream_init_prederived(stream, algorithm, material, material_size);
+        memzero(material, sizeof(material));
+        return ready;
     }
 
     return false;
 }
+#endif
 
 bool kdbx_protected_stream_apply(KDBXProtectedStream* stream, uint8_t* data, size_t data_size) {
     furi_assert(stream);
@@ -560,9 +623,13 @@ bool kdbx_protected_stream_apply(KDBXProtectedStream* stream, uint8_t* data, siz
         if(stream->block_offset >= sizeof(stream->block)) {
             if(stream->algorithm == KDBXProtectedStreamChaCha20) {
                 kdbx_chacha20_generate_block(stream);
-            } else if(stream->algorithm == KDBXProtectedStreamSalsa20) {
+            }
+#if KDBX_PROTECTED_ENABLE_SALSA20
+            else if(stream->algorithm == KDBXProtectedStreamSalsa20) {
                 kdbx_salsa20_generate_block(stream);
-            } else {
+            }
+#endif
+            else {
                 return false;
             }
         }
@@ -638,5 +705,20 @@ bool kdbx_chacha20_xor(
         return false;
     }
 
-    return kdbx_protected_stream_apply(&stream, data, data_size);
+#if KDBX_PROTECTED_CHACHA_XOR_STANDALONE
+    for(size_t i = 0; i < data_size; i++) {
+        if(stream.block_offset >= sizeof(stream.block)) {
+            kdbx_chacha20_generate_block(&stream);
+        }
+
+        data[i] ^= stream.block[stream.block_offset++];
+    }
+
+    memzero(&stream, sizeof(stream));
+    return true;
+#else
+    const bool ok = kdbx_protected_stream_apply(&stream, data, data_size);
+    memzero(&stream, sizeof(stream));
+    return ok;
+#endif
 }

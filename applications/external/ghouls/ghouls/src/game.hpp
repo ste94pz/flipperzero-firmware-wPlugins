@@ -5,6 +5,7 @@
 #include "player.hpp"
 #include "time.hpp"
 #include "sound.hpp"
+#include "enemy.hpp"
 
 #if SKY_RENDER_ALLOWED
 #include "sky.hpp"
@@ -31,10 +32,12 @@ private:
     int lastInput = -1; // Last input key pressed
     Player* player = nullptr; // Player instance
     bool shouldExit = false; // Flag to signal exit the game
+    char selectedMapFile[128] = {0}; // map file to load for the next local game
     int atoi(const char* nptr) {
         return (int)strtol(nptr, NULL, 10);
     } // convert string to integer
     Vector getRandomGhoulPosition(Level* level); // get a random position for spawning ghouls
+    EnemyType getRandomGhoulType() const; // get a random enemy type for spawning ghouls
     Vector getRandomWeaponPosition(Level* level); // get a random position for spawning weapons
     WeaponType getUniqueWeaponType(
         Level* level); // get a unique weapon type (only two of each type allowed)
@@ -50,11 +53,11 @@ private:
     bool removeGhoulsFromLevel(); // remove all ghouls from the level
 
 #if GROUND_RENDER_ALLOWED
-    bool setGroundType(GroundType groundType); // set the ground type for the current level
+    bool setGroundType(TimeOfDay timeOfDay); // set the ground type for the current level
 #endif
 
 #if SKY_RENDER_ALLOWED
-    bool setSkyType(SkyType skyType); // set the sky instance for day/night cycle
+    bool setSkyType(TimeOfDay timeOfDay); // set the sky instance for day/night cycle
 #endif
 
     bool spawnGhouls(uint8_t count); // Spawn ghouls into the current level for the current round
@@ -102,6 +105,9 @@ public:
     void resetInput() {
         lastInput = -1;
     } // Reset input after processing
+    void setSelectedMapFile(
+        const char* filename); // set the map file to use when starting the next local game
+    bool soundAllowed() const; // Check if sound is allowed based on player settings
     bool startGame(); // start the actual game
     bool startGameOnline(); // start the online multiplayer game
     void updateDraw(); // update and draw the game

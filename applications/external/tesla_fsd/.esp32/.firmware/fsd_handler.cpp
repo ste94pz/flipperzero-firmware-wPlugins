@@ -30,8 +30,9 @@ static uint8_t read_mux_id(const CanFrame *frame) {
     return frame->data[0] & 0x07;
 }
 
-static bool is_fsd_selected(const CanFrame *frame, bool force_fsd) {
+static bool is_fsd_selected(const CanFrame *frame, bool force_fsd, bool china_mode) {
     if (force_fsd) return true;
+    if (china_mode) return true;
     if (frame->dlc < 5) return false;
     // DAS_autopilotControl byte 4 bits [7:6] = UI "FSD selected" flag (bit 38 in the 64-bit data
     // field).  Note: bit 46 is the *output* FSD-activation bit written to the modified frame —
@@ -51,7 +52,13 @@ void fsd_state_init(FSDState *state, TeslaHWVersion hw) {
     state->suppress_speed_chime = true;
     state->emergency_vehicle_detect = false;
     state->force_fsd            = false;
+    state->china_mode           = false;
     state->bms_output           = false;
+#if defined(BOARD_TTGO_DISPLAY)
+    state->display_enabled      = true;
+    state->display_brightness   = 50;
+    state->display_timeout_s    = 60;
+#endif
     state->sleep_idle_ms        = SLEEP_IDLE_MS;
 
     strncpy(state->wifi_ssid, "Tesla-FSD", sizeof(state->wifi_ssid));
@@ -153,7 +160,7 @@ bool fsd_handle_autopilot_frame(FSDState *state, CanFrame *frame) {
         return false;
 
     uint8_t mux     = read_mux_id(frame);
-    bool    fsd_ui  = is_fsd_selected(frame, state->force_fsd);
+    bool    fsd_ui  = is_fsd_selected(frame, state->force_fsd, state->china_mode);
     bool    modified = false;
 
     // mux 0 is the authoritative "is FSD requested" mux
@@ -237,7 +244,7 @@ bool fsd_handle_legacy_autopilot(FSDState *state, CanFrame *frame) {
     if (frame->dlc < 8) return false;
 
     uint8_t mux    = read_mux_id(frame);
-    bool    fsd_ui = is_fsd_selected(frame, state->force_fsd);
+    bool    fsd_ui = is_fsd_selected(frame, state->force_fsd, state->china_mode);
     bool    modified = false;
 
     if (mux == 0) state->fsd_enabled = fsd_ui;

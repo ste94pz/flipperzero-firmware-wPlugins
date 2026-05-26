@@ -59,36 +59,63 @@
 - Read-modify-retransmit on CAN ID `0x331` — sets `DAS_autopilot` to SELF_DRIVING
 - Confirmed working on Palladium (Model S Plaid 2023), HW4 Highland (Model 3 Performance 2024), and Intel HW3 (with AP-first workaround)
 - Does NOT restore full FSD visualization — only TLSSC (stop signs / traffic lights)
+- **Recommended banned-car combination**: enable **TLSSC Restore** + **TLSSC bit38** (`0x3FD` mux 0 bit 38) together — confirmed reliable on HW3 / 2026.2.6 by @RoyRakete ([#18](https://github.com/hypery11/flipper-tesla-fsd/issues/18#issuecomment-4413430516)). Either toggle alone is unreliable on some banned firmware; the pair re-enables AP/TACC engagement
 
 ### Ban Shield (v2.9+)
-- Freezes `GTW_carConfig` (`0x7FF`) in its healthy state
+- Watches `GTW_carConfig` (`0x7FF`) and rewrites the bus broadcast back to its learned-healthy pattern in real time
 - Learns all 8 mux frames on first run, then auto-arms
-- Any server-side ban push is blocked at the CAN frame level in real-time
+- **Important caveat:** this is a **CAN-broadcast-layer mask**, not entitlement-layer protection. Tesla's ban writes to GTW NVRAM (which survives reboots) and to server-side flags; Ban Shield only rewrites what other on-bus ECUs see, not the underlying NVRAM state or Tesla's backend record. No empirical case where Ban Shield prevented a ban has been confirmed — it is a defense-in-depth measure based on attack-surface analysis. See [#60](https://github.com/hypery11/flipper-tesla-fsd/issues/60) for the full honest writeup
 
 ### Nag Killer (v2.1+)
 - DAS-aware gating — only echoes when DAS is actually demanding hands-on, zero bus traffic when DAS is satisfied
 - Organic torque variation — xorshift32 PRNG random walk in 1.00-2.40 Nm with grip pulse excursions to 3.10-3.30 Nm every 5-9 seconds
 - EPAS counter+1 echo on `0x370` with level 0 (nag imminent) and level 3 (escalated alarm) suppression
 
+### AP-First mode (v2.14+, for 2026.14.x firmware)
+- Tesla 2026.14.x added a preflight check that blocks AP/TACC engagement if CAN injection is already active
+- When **AP-First** is enabled, the app monitors `DAS_autopilotState` from `0x39B` and only starts injecting `0x3FD` after AP is engaged
+- Nag killer, TLSSC Restore, and Ban Shield are unaffected (they target different CAN IDs)
+
 ### Diagnostics (read-only, no FSD required)
-- Live BMS dashboard: pack voltage, current, SoC, temperature range
+- Live BMS dashboard: pack voltage, current, SoC, temperature range, **energy consumption (Wh/km)**
 - Vehicle speed, steering angle, motor torque, brake state
-- DAS status: hands-on nag level, lane change state, blind spot warning, FCW, vision speed limit
+- DAS status: autopilot state, hands-on nag level, lane change state, blind spot warning, FCW, vision speed limit
 - GTW autopilot tier readback (NONE/HIGHWAY/ENHANCED/SELF_DRIVING/BASIC)
 - OTA detection with debounce — auto-suspends TX during firmware updates
 
 ### Settings (runtime toggles)
 
+**Stable (car-tested):**
+
 | Setting | Description |
 |---------|-------------|
 | **Mode** | `Active` / `Listen-Only` / `Service`. Listen-Only is the **first-boot default** — MCP2515 is in hardware listen-only mode and physically cannot TX. |
+| **Nag Killer** | DAS-aware EPAS counter+1 echo with organic torque variation. |
 | **Force FSD** | Bypass the `isFSDSelectedInUI` check. Does not bypass Tesla's server-side entitlement — only affects local CAN frame flow. |
 | **TLSSC Restore** | 0x331 DAS config spoof to recover TLSSC on banned vehicles. Triggers MCU reboot. |
-| **Ban Shield** | Freeze `GTW_carConfig` (0x7FF) to block server-side VIN bans. Auto-learns healthy state, then arms. |
-| **Nag Killer** | DAS-aware EPAS counter+1 echo with organic torque variation. |
+| **AP-First (14.x)** | Delay 0x3FD injection until AP is engaged. Required for Tesla firmware 2026.14.x. |
+| **Ban Shield** | Rewrite `GTW_carConfig` (0x7FF) broadcasts back to a learned-healthy pattern. CAN-broadcast-layer mask only — does not undo NVRAM or backend-side ban flags. Defense-in-depth, no confirmed ban-prevention case ([#60](https://github.com/hypery11/flipper-tesla-fsd/issues/60)). |
 | **Suppress Chime** | Kill the ISA speed warning chime (HW4 only, `0x399`). |
 | **Emerg. Vehicle** | Enable emergency vehicle detection flag (HW4 only, bit59). |
 | **Precondition** | Battery preheat trigger via `0x082`. |
+
+**Beta (untested, please report results):**
+
+| Setting | CAN ID | Description |
+|---------|--------|-------------|
+| **Nav FSD Route** | `0x3F8` bits 13/48/49 | Enable nav-based FSD routing (EU/restricted regions) |
+| **TLSSC bit38** | `0x3FD` mux0 bit38 | Explicit TLSSC enable; pair with TLSSC Restore (0x331) as the recommended banned-car combo |
+| **Lane Graph** | `0x3FD` mux1 bit45 | UI_showLaneGraph — lane visualization on non-FSD tier |
+| **Tier Override** | `0x7FF` mux=2 | Force GTW_autopilot to SELF_DRIVING (more aggressive than Ban Shield) |
+| **Dev Mode** | `0x3F8` bit5 | UI_dasDeveloper flag |
+| **Force LHD** | `0x3F8` bits 40-41 | UI_drivingSide signal override. **Empirically does not change FSD lane-side behavior** (tested on banned RHD HW3 / 2026.2.6 — values 0, 1, 2 all leave FSD on the LHD side; see [#66](https://github.com/hypery11/flipper-tesla-fsd/issues/66)). Likely a UI-only signal. **Slated for removal in v2.15** if no value-3 / DAS_settings counter-evidence surfaces |
+| **Hands-Off** | `0x3F8` bit14 | UI-level hands-on disable (second nag vector) |
+| **Telemetry Off** | `0x3F8` bit43 | Disable trip telemetry — may itself be a ban signal, use only with SIM pulled |
+
+**Hardware:**
+
+| Setting | Description |
+|---------|-------------|
 | **MCP Crystal** | 16 / 8 / 12 MHz — match your CAN module's crystal frequency. |
 
 ### HW Support
@@ -213,16 +240,18 @@ Single-bus read-modify-retransmit on Party CAN. No MITM, no second bus tap.
 | `0x331` | `DAS_autopilotConfig` | TX | TLSSC Restore — set tier to SELF_DRIVING |
 | `0x370` | `EPAS3P_sysStatus` | TX | Nag killer — counter+1 echo with organic torque |
 | `0x399` | `ISA_speedLimit` | TX | Speed chime suppression (HW4) |
-| `0x3FD` | `UI_autopilotControl` | TX | FSD unlock — bit46/60 (HW3/HW4) |
+| `0x3FD` | `UI_autopilotControl` | TX | FSD unlock — bit46/60 (HW3/HW4), TLSSC bit38, lane graph bit45 |
+| `0x3F8` | `UI_driverAssistControl` | TX | Nav FSD route, hands-off, dev mode, LHD, telemetry (beta) |
 | `0x3EE` | `UI_autopilotControl` | TX | FSD unlock — Legacy HW1/HW2 |
-| `0x7FF` | `GTW_carConfig` | TX | Ban Shield — freeze healthy config |
+| `0x7FF` | `GTW_carConfig` | TX | Ban Shield freeze + active tier override |
 | `0x082` | `UI_tripPlanning` | TX | Battery preconditioning trigger |
 | `0x398` | `GTW_carConfig` | RX | HW version detection |
 | `0x318` | `GTW_carState` | RX | OTA detection (auto-suspend TX) |
-| `0x39B` | `DAS_status` | RX | AP state, nag level, lane change, blind spot |
+| `0x39B` | `DAS_status` | RX | AP state (for AP-First), nag level, lane change, blind spot |
 | `0x132` | `BMS_hvBusStatus` | RX | Pack voltage / current |
 | `0x292` | `BMS_socStatus` | RX | State of charge |
 | `0x312` | `BMS_thermalStatus` | RX | Battery temperature |
+| `0x33A` | `UI_ratedConsumption` | RX | Energy consumption (Wh/km) |
 
 Full list of 37 handlers (14 TX, 23 RX) in [`fsd_logic/fsd_handler.h`](fsd_logic/fsd_handler.h).
 
@@ -268,6 +297,14 @@ For the Flipper: yes, any MCP2515-based module (Electronic Cats, generic boards)
 - [ElectronicCats/flipper-MCP2515-CANBUS](https://github.com/ElectronicCats/flipper-MCP2515-CANBUS) — MCP2515 driver for Flipper
 - Community contributors: @THER4iN, @MiniCS, @kp43h8, @gauner1986, @dmagyar, @ViPiMP, @marcobellinoroci-source, @danpadure, @bruvv, @Symness, @hkloudou, @nagotti, @patatman, @JordanzhaoD — ban research, platform testing, ESP32 improvements, bug fixes
 - `Starmixcraft/tesla-fsd-can-mod` — original CanFeather FSD research (GitLab repo removed; mirror at [Karolynaz/waymo-fsd-can-mod](https://github.com/Karolynaz/waymo-fsd-can-mod))
+
+## Support the research
+
+If this project saved you money on an aftermarket dongle, helped you understand Tesla's CAN bus, or kept your TLSSC working through a ban, consider supporting the ongoing research and testing.
+
+[![PayPal](https://img.shields.io/badge/PayPal-Donate-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://www.paypal.com/cgi-bin/webscr?cmd=_xclick&business=hypery11@gmail.com&item_name=Tesla+FSD+Open+Source+Research&currency_code=USD) [![GitHub Sponsors](https://img.shields.io/badge/Sponsor-hypery11-EA4AAA?style=for-the-badge&logo=github&logoColor=white)](https://github.com/sponsors/hypery11)
+
+Funds go toward Tesla parts for testing (banned VINs to recover, different MCU/HW combos), ESP32 hardware variants, and time spent reverse-engineering new firmware versions.
 
 ## License
 

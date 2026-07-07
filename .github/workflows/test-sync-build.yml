@@ -1,0 +1,67 @@
+name: Test sync upstream and build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-sync-upstream-build
+  cancel-in-progress: false
+
+jobs:
+  test-sync-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Add and fetch upstream
+        run: |
+          git remote add upstream https://github.com/RogueMaster/flipperzero-firmware-wPlugins.git || true
+          git fetch upstream 420 --tags
+
+      - name: Test merge upstream 420 into current branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout "$GITHUB_REF_NAME"
+          git merge --no-commit --no-ff upstream/420
+
+      - name: Sync submodules
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Show repository status before build
+        run: |
+          git status --short
+          git submodule status --recursive
+
+      - name: Build updater package
+        run: |
+          chmod +x ./fbt
+          ./fbt COMPACT=1 DEBUG=0 updater_package
+
+      - name: Show build outputs
+        if: always()
+        run: |
+          find dist -maxdepth 5 -type f 2>/dev/null | sort || true
+
+      - name: Upload build artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-flipperzero-silent-updater-package
+          path: |
+            dist/**/*.tgz
+            dist/**/*.zip
+            dist/**/f7-update-*
+            dist/**/updater_package*
+          if-no-files-found: warn
